@@ -39,6 +39,7 @@ async function run() {
     const usersCollection = db.collection("users");
     const tasksCollection = db.collection("task");
     const paymentsCollection = db.collection("payment");
+    const submissionCollection = db.collection("submission");
 
     // Create User
     app.post("/users", async (req, res) => {
@@ -193,6 +194,35 @@ async function run() {
       } catch (error) {
         res.status(500).send({ message: "Failed to get payment history" });
       }
+    });
+
+    // worker dashboard get all task
+    app.get("/tasks/available", async (req, res) => {
+      const tasks = await tasksCollection
+        .find({ required_workers: { $gt: 0 } })
+        .toArray();
+      res.send(tasks);
+    });
+
+    // TaskList
+    app.get("/tasks/:id", async (req, res) => {
+      const { id } = req.params;
+      const task = await tasksCollection.findOne({ _id: new ObjectId(id) });
+      res.send(task);
+    });
+
+    // worl submissions
+    app.post("/submissions", async (req, res) => {
+      const submission = req.body;
+      const result = await submissionCollection.insertOne(submission);
+
+      // Optional: Decrease required_workers by 1
+      await tasksCollection.updateOne(
+        { _id: new ObjectId(submission.task_id) },
+        { $inc: { required_workers: -1 } }
+      );
+
+      res.send(result);
     });
 
     // Ping success
