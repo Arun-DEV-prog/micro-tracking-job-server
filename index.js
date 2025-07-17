@@ -40,6 +40,7 @@ async function run() {
     const tasksCollection = db.collection("task");
     const paymentsCollection = db.collection("payment");
     const submissionCollection = db.collection("submission");
+    const withdrawalsCollection = db.collection("withdrawals");
 
     // Create User
     app.post("/users", async (req, res) => {
@@ -196,6 +197,122 @@ async function run() {
       }
     });
 
+    // buyer state home page
+    app.get("/buyer/stats", async (req, res) => {
+      const email = req.query.email;
+
+      if (!email) {
+        return res.status(400).json({ error: "Email is required" });
+      }
+
+      try {
+        const tasks = await tasksCollection
+          .find({ buyer_email: email })
+          .toArray();
+
+        const taskCount = tasks.length;
+
+        // Count of total required_workers left (pending workers)
+        const pendingWorkerCount = tasks.reduce(
+          (sum, task) => sum + (task.required_workers || 0),
+          0
+        );
+
+        // Count total submissions for this buyer's tasks that are approved
+        const taskIds = tasks.map((task) => task._id.toString());
+
+        const approvedSubmissions = await submissionCollection
+          .find({
+            task_id: { $in: taskIds },
+            status: "approved",
+          })
+          .toArray();
+
+        const totalPaid = approvedSubmissions.reduce(
+          (sum, sub) => sum + (sub.payable_amount || 0),
+          0
+        );
+
+        res.json({ taskCount, pendingWorkerCount, totalPaid });
+      } catch (err) {
+        console.error("Error in /buyer/stats", err);
+        res.status(500).json({ error: "Server error" });
+      }
+    });
+
+    // getting submission for review
+    app.get("/buyer/pending-submissions", async (req, res) => {
+      const email = req.query.email;
+
+      if (!email) {
+        return res.status(400).send({ error: "Buyer email is required" });
+      }
+
+      try {
+        // Step 1: Get all task IDs for this buyer
+        const tasks = await tasksCollection
+          .find({ buyer_email: email })
+          .toArray();
+        const taskIds = tasks.map((task) => task._id.toString());
+
+        // Step 2: Find pending submissions linked to those tasks
+        const pendingSubmissions = await submissionCollection
+          .find({
+            task_id: { $in: taskIds },
+            status: "pending",
+          })
+          .toArray();
+
+        res.send(pendingSubmissions);
+      } catch (err) {
+        console.error("Error fetching pending submissions:", err);
+        res.status(500).send({ error: "Server error" });
+      }
+    });
+
+    // approve submission
+    app.patch("/submissions/:id/approve", async (req, res) => {
+      const id = req.params.id;
+
+      const submission = await submissionCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      const updateSubmission = await submissionCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status: "approved" } }
+      );
+
+      // Update worker coin
+      await usersCollection.updateOne(
+        { email: submission.worker_email },
+        { $inc: { coin: submission.payable_amount } }
+      );
+
+      res.send(updateSubmission);
+    });
+
+    // reject submission
+    app.patch("/submissions/:id/reject", async (req, res) => {
+      const id = req.params.id;
+
+      const submission = await submissionCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      const updateSubmission = await submissionCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status: "rejected" } }
+      );
+
+      await tasksCollection.updateOne(
+        { _id: new ObjectId(submission.task_id) },
+        { $inc: { required_workers: 1 } }
+      );
+
+      res.send(updateSubmission);
+    });
+
     // worker dashboard get all task
     app.get("/tasks/available", async (req, res) => {
       const tasks = await tasksCollection
@@ -223,6 +340,63 @@ async function run() {
       );
 
       res.send(result);
+    });
+    //  create get submission routes
+    app.get("/submissions", async (req, res) => {
+      const email = req.query.email;
+      if (!email) return res.send([]);
+
+      const submissions = await submissionCollection
+        .find({ worker_email: email })
+        .toArray();
+
+      res.send(submissions);
+    });
+    // withdraw
+    // Express POST route
+    // Express POST route
+    app.post("/withdrawals", async (req, res) => {
+      const {
+        worker_email,
+        worker_name,
+        withdrawal_coin,
+        withdrawal_amount,
+        payment_system,
+        account_number,
+        withdraw_date,
+        status,
+      } = req.body;
+
+      if (
+        !worker_email ||
+        !withdrawal_coin ||
+        !withdrawal_amount ||
+        !payment_system
+      ) {
+        return res.status(400).send({ message: "Missing required fields" });
+      }
+
+      const result = await withdrawalsCollection.insertOne({
+        worker_email,
+        worker_name,
+        withdrawal_coin,
+        withdrawal_amount,
+        payment_system,
+        account_number,
+        withdraw_date,
+        status,
+      });
+
+      if (result.insertedId) {
+        // Update user coin after withdrawal
+        await usersCollection.updateOne(
+          { email: worker_email },
+          { $inc: { coin: -withdrawal_coin } }
+        );
+        res.send({ success: true });
+      } else {
+        res.status(500).send({ message: "Insertion failed" });
+      }
     });
 
     // Ping success
