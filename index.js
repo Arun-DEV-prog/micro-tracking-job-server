@@ -1,7 +1,8 @@
+const dotenv = require("dotenv");
 const express = require("express");
 const cors = require("cors");
+const jwt = require("jsonwebtoken");
 
-const dotenv = require("dotenv");
 const app = express();
 const port = 3000;
 
@@ -41,9 +42,180 @@ async function run() {
     const paymentsCollection = db.collection("payment");
     const submissionCollection = db.collection("submission");
     const withdrawalsCollection = db.collection("withdrawals");
+    // for admin
+
+    const verifyJWT = (req, res, next) => {
+      const token = req.headers?.authorization?.split(" ")[1];
+      if (!token) return res.status(401).send({ message: "unauthorized" });
+
+      jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
+        if (err) return res.status(403).send({ message: "forbidden" });
+        req.decoded = decoded;
+        next();
+      });
+    };
+
+    const verifyAdmin = (usersCollection) => {
+      return async (req, res, next) => {
+        const email = req.decoded.email;
+        const user = await usersCollection.findOne({ email });
+        if (user?.role !== "Admin") {
+          return res.status(403).send({ message: "forbidden - not admin" });
+        }
+        next();
+      };
+    };
+
+    app.post("/jwt", async (req, res) => {
+      const user = req.body;
+      const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
+        expiresIn: "7d",
+      });
+      res.send({ token });
+    });
+
+    // user?admin
+    app.get(
+      "/users/admin/:email",
+      verifyJWT,
+      verifyAdmin(usersCollection),
+      async (req, res) => {
+        const email = req.params.email;
+        if (req.decoded.email !== email) {
+          return res.status(403).send({ message: "forbidden" });
+        }
+        const user = await usersCollection.findOne({ email });
+        res.send({ admin: user?.role === "Admin" });
+      }
+    );
+
+    // Route: /admin/stats
+    // GET /admin-stats
+    app.get(
+      "/admin-stats",
+      verifyJWT,
+      verifyAdmin(usersCollection),
+      async (req, res) => {
+        const totalWorker = await usersCollection.countDocuments({
+          role: "Worker",
+        });
+        const totalBuyer = await usersCollection.countDocuments({
+          role: "Buyer",
+        });
+
+        const users = await usersCollection.find({}).toArray();
+        const totalCoins = users.reduce(
+          (acc, user) => acc + (user.coin || 0),
+          0
+        );
+
+        const totalPayments = await paymentsCollection
+          .aggregate([
+            {
+              $group: {
+                _id: null,
+
+                payable_amount: { $sum: "$amount" },
+              },
+            },
+          ])
+          .toArray();
+
+        res.send({
+          totalWorker,
+          totalBuyer,
+          totalCoins,
+          totalPayments: totalPayments[0]?.totalAmount || 0,
+        });
+      }
+    );
+
+    // GET /withdraw-requests
+    app.get(
+      "/withdraw-requests",
+      verifyJWT,
+      verifyAdmin(usersCollection),
+      async (req, res) => {
+        const requests = await withdrawalsCollection
+          .find({ status: "pending" })
+          .toArray();
+        res.send(requests);
+      }
+    );
+
+    // PATCH /withdraw-requests/:id/approve
+    app.patch(
+      "/withdraw-requests/:id/approve",
+      verifyJWT,
+      verifyAdmin(usersCollection),
+      async (req, res) => {
+        const id = req.params.id;
+
+        const request = await withdrawalsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!request)
+          return res.status(404).send({ error: "Withdraw not found" });
+
+        // Update status
+        await withdrawalsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status: "approved" } }
+        );
+
+        // Decrease coins from user
+        await usersCollection.updateOne(
+          { email: request.worker_email },
+          { $inc: { coin: -request.withdrawal_coin } }
+        );
+
+        res.send({ message: "Withdrawal approved and coins deducted" });
+      }
+    );
+
+    app.get("/users", verifyJWT, async (req, res) => {
+      try {
+        const users = await usersCollection.find().toArray();
+        res.status(200).json(users);
+      } catch (err) {
+        res
+          .status(500)
+          .json({ message: "Failed to fetch users", error: err.message });
+      }
+    });
+
+    // DELETE user
+    app.delete(
+      "/users/:id",
+      verifyJWT,
+      verifyAdmin(usersCollection),
+      async (req, res) => {
+        const id = req.params.id;
+        const result = await usersCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+        res.send(result);
+      }
+    );
+
+    // PATCH role update
+    app.patch(
+      "/users/:id",
+      verifyJWT,
+      verifyAdmin(usersCollection),
+      async (req, res) => {
+        const id = req.params.id;
+        const { role } = req.body;
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { role } }
+        );
+        res.send(result);
+      }
+    );
 
     // Create User
-    app.post("/users", async (req, res) => {
+    app.post("/users", verifyJWT, async (req, res) => {
       try {
         const { uid, name, email, photoURL, role } = req.body;
 
@@ -64,7 +236,7 @@ async function run() {
           email,
           photoURL,
           role,
-          coins: coin,
+          coin: coin,
           createdAt: new Date(),
         };
 
@@ -108,6 +280,48 @@ async function run() {
       res.send(result);
     });
 
+    app.get("/task", async (req, res) => {
+      try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 5;
+        const skip = (page - 1) * limit;
+
+        const total = await tasksCollection.estimatedDocumentCount();
+        const data = await tasksCollection
+          .find()
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+
+        res.status(200).json({
+          data,
+          total,
+          totalPages: Math.ceil(total / limit),
+        });
+      } catch (error) {
+        res
+          .status(500)
+          .json({ message: "Failed to get tasks", error: error.message });
+      }
+    });
+
+    app.delete("/task/:id", async (req, res) => {
+      const id = req.params.id;
+      try {
+        const result = await tasksCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+        if (result.deletedCount === 1) {
+          res.status(200).json({ message: "Task deleted" });
+        } else {
+          res.status(404).json({ message: "Task not found" });
+        }
+      } catch (error) {
+        res
+          .status(500)
+          .json({ message: "Failed to delete task", error: error.message });
+      }
+    });
     // Get tasks by buyer email
     app.get("/tasks/buyer/:email", async (req, res) => {
       const email = req.params.email;
