@@ -215,7 +215,7 @@ async function run() {
     );
 
     // Create User
-    app.post("/users", verifyJWT, async (req, res) => {
+    app.post("/users", async (req, res) => {
       try {
         const { uid, name, email, photoURL, role } = req.body;
 
@@ -323,7 +323,7 @@ async function run() {
       }
     });
     // Get tasks by buyer email
-    app.get("/tasks/buyer/:email", async (req, res) => {
+    app.get("/tasks/buyer/:email", verifyJWT, async (req, res) => {
       const email = req.params.email;
       const tasks = await tasksCollection
         .find({ buyer_email: email })
@@ -610,6 +610,81 @@ async function run() {
         res.send({ success: true });
       } else {
         res.status(500).send({ message: "Insertion failed" });
+      }
+    });
+
+    app.get("/best-workers", async (req, res) => {
+      try {
+        const bestWorkers = await usersCollection
+          .find({ role: "Worker" })
+          .sort({ coin: -1 })
+          .limit(6)
+          .project({ name: 1, email: 1, coin: 1, photo: 1 })
+          .toArray();
+
+        res.json(bestWorkers);
+      } catch (err) {
+        res.status(500).json({ error: "Failed to fetch best workers." });
+      }
+    });
+
+    // routes/submissions.js or inside your index.js
+
+    // GET /worker-stats/:email
+    // Inside your Express routes file
+    // Add these routes in your Express setup
+
+    // ✅ Worker Stats Route
+    app.get("/worker-stats", verifyJWT, async (req, res) => {
+      const email = req.decoded.email;
+
+      try {
+        const totalSubmission = await submissionCollection.countDocuments({
+          worker_email: email,
+        });
+
+        const totalPending = await submissionCollection.countDocuments({
+          worker_email: email,
+          status: "pending",
+        });
+
+        const approvedSubmissions = await submissionCollection
+          .find({ worker_email: email, status: "approved" })
+          .toArray();
+
+        const totalEarning = approvedSubmissions.reduce(
+          (sum, item) => sum + (item.payable_amount || 0),
+          0
+        );
+
+        res.send({
+          totalSubmission,
+          totalPending,
+          totalEarning,
+        });
+      } catch (err) {
+        res.status(500).send({ error: "Failed to fetch worker stats" });
+      }
+    });
+
+    // ✅ Approved Submissions Route
+    app.get("/worker/approved-submissions", verifyJWT, async (req, res) => {
+      const email = req.query.email;
+
+      try {
+        const approved = await submissionCollection
+          .find({ worker_email: email, status: "approved" })
+          .project({
+            task_title: 1,
+            payable_amount: 1,
+            Buyer_name: 1,
+            status: 1,
+          })
+          .toArray();
+
+        res.send(approved);
+      } catch (err) {
+        res.status(500).send({ error: "Failed to fetch approved submissions" });
       }
     });
 
