@@ -10,7 +10,7 @@ dotenv.config();
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 app.use(
   cors({
-    origin: "http://localhost:5173", // or wherever your frontend runs
+    origin: ["http://localhost:5173", "https://aruncse21.web.app"], // or wherever your frontend runs
     credentials: true,
   })
 );
@@ -34,7 +34,7 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    await client.connect();
+    //await client.connect();
 
     const db = client.db("microTaskingDB");
     const usersCollection = db.collection("users");
@@ -42,6 +42,9 @@ async function run() {
     const paymentsCollection = db.collection("payment");
     const submissionCollection = db.collection("submission");
     const withdrawalsCollection = db.collection("withdrawals");
+    const notificationCollection = db.collection("notifications");
+
+    global.notificationCollection = notificationCollection;
     // for admin
 
     const verifyJWT = (req, res, next) => {
@@ -72,6 +75,122 @@ async function run() {
         expiresIn: "7d",
       });
       res.send({ token });
+    });
+
+    async function createNotification({ message, toEmail, actionRoute }) {
+      await notificationCollection.insertOne({
+        message,
+        toEmail,
+        actionRoute,
+        time: new Date(),
+      });
+    }
+
+    app.post("/notifications", async (req, res) => {
+      const { toEmail, message, actionRoute } = req.body;
+
+      if (!toEmail || !message) {
+        return res.status(400).send({ message: "Missing fields" });
+      }
+
+      const notification = {
+        toEmail,
+        message,
+        actionRoute: actionRoute || "/",
+        time: new Date(),
+      };
+
+      try {
+        const result = await notificationCollection.insertOne(notification);
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Notification create failed" });
+      }
+    });
+
+    app.get("/notifications/:email", async (req, res) => {
+      const email = req.params.email;
+      const notifications = await notificationCollection
+        .find({ toEmail: email })
+        .sort({ time: -1 })
+        .toArray();
+      res.send(notifications);
+    });
+
+    // =============================
+    // ✅ Create New Submission (Worker to Buyer Notification)
+    // =============================
+    app.post("/submissions", verifyJWT, async (req, res) => {
+      const submission = req.body;
+      const result = await submissionCollection.insertOne(submission);
+
+      // Notify Buyer
+      const task = await tasksCollection.findOne({
+        _id: new ObjectId(submission.task_id),
+      });
+      const buyer = await usersCollection.findOne({ email: task.buyer_email });
+
+      await createNotification({
+        message: `${submission.worker_name} submitted work for your task "${task.task_title}"`,
+        toEmail: buyer.email,
+        actionRoute: "/dashboard/buyer-review",
+      });
+
+      res.send(result);
+    });
+
+    app.patch("/submissions/status/:id", verifyJWT, async (req, res) => {
+      const id = req.params.id;
+      const { status, payable_amount } = req.body;
+
+      const submission = await submissionCollection.findOne({
+        _id: new ObjectId(id),
+      });
+      const task = await tasksCollection.findOne({
+        _id: new ObjectId(submission.task_id),
+      });
+
+      await submissionCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status } }
+      );
+
+      let msg = "";
+      if (status === "approved") {
+        msg = `You have earned $${payable_amount} from ${task.buyer_name} for completing "${task.task_title}"`;
+      } else if (status === "rejected") {
+        msg = `Your submission for "${task.task_title}" was rejected by ${task.buyer_name}`;
+      }
+
+      await createNotification({
+        message: msg,
+        toEmail: submission.worker_email,
+        actionRoute: "/dashboard/worker-home",
+      });
+
+      res.send({ message: "Status updated and notification sent" });
+    });
+
+    app.patch("/withdrawals/approve/:id", verifyJWT, async (req, res) => {
+      const id = req.params.id;
+
+      const withdrawal = await withdrawalCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      await withdrawalCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status: "approved" } }
+      );
+
+      // Notify Worker
+      await createNotification({
+        message: `Your withdrawal request of $${withdrawal.withdrawal_amount} has been approved by Admin`,
+        toEmail: withdrawal.worker_email,
+        actionRoute: "/dashboard/worker-withdrawals",
+      });
+
+      res.send({ message: "Withdrawal approved and notification sent" });
     });
 
     // user?admin
@@ -173,7 +292,7 @@ async function run() {
       }
     );
 
-    app.get("/users", verifyJWT, async (req, res) => {
+    app.get("/users", async (req, res) => {
       try {
         const users = await usersCollection.find().toArray();
         res.status(200).json(users);
@@ -217,35 +336,42 @@ async function run() {
     // Create User
     app.post("/users", async (req, res) => {
       try {
-        const { uid, name, email, photoURL, role } = req.body;
+        const { uid = null, name, email, photoURL = null, role } = req.body;
 
-        if (!email || !role) {
+        // Check required fields
+        if (!name || !email || !role) {
           return res.status(400).json({ message: "Missing required fields" });
         }
 
+        // Check if user already exists
         const existingUser = await usersCollection.findOne({ email });
         if (existingUser) {
-          return res.status(400).json({ message: "User already exists" });
+          return res.status(409).json({ message: "User already exists" });
         }
 
-        const coin = role === "Buyer" ? 50 : 10;
+        // Assign coins based on role
+        const coin = role.toLowerCase() === "buyer" ? 50 : 10;
 
+        // Create new user object
         const newUser = {
           uid,
           name,
           email,
           photoURL,
           role,
-          coin: coin,
+          coin,
           createdAt: new Date(),
         };
 
+        // Insert into database
         const result = await usersCollection.insertOne(newUser);
-        return res
-          .status(201)
-          .json({ success: true, insertedId: result.insertedId });
+        return res.status(201).json({
+          success: true,
+          insertedId: result.insertedId,
+          message: "User created successfully",
+        });
       } catch (err) {
-        console.error(err);
+        console.error("User creation error:", err);
         return res.status(500).json({ message: "Internal server error" });
       }
     });
@@ -280,7 +406,7 @@ async function run() {
       res.send(result);
     });
 
-    app.get("/task", async (req, res) => {
+    app.get("/task", verifyJWT, async (req, res) => {
       try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 5;
@@ -323,7 +449,7 @@ async function run() {
       }
     });
     // Get tasks by buyer email
-    app.get("/tasks/buyer/:email", verifyJWT, async (req, res) => {
+    app.get("/tasks/buyer/:email", async (req, res) => {
       const email = req.params.email;
       const tasks = await tasksCollection
         .find({ buyer_email: email })
@@ -398,7 +524,7 @@ async function run() {
 
     // payments history
     // Get payment history by user email
-    app.get("/payments/:email", async (req, res) => {
+    app.get("/payments/:email", verifyJWT, async (req, res) => {
       const email = req.params.email;
       try {
         const payments = await paymentsCollection
@@ -412,7 +538,7 @@ async function run() {
     });
 
     // buyer state home page
-    app.get("/buyer/stats", async (req, res) => {
+    app.get("/buyer/stats", verifyJWT, async (req, res) => {
       const email = req.query.email;
 
       if (!email) {
@@ -455,7 +581,7 @@ async function run() {
     });
 
     // getting submission for review
-    app.get("/buyer/pending-submissions", async (req, res) => {
+    app.get("/buyer/pending-submissions", verifyJWT, async (req, res) => {
       const email = req.query.email;
 
       if (!email) {
@@ -485,7 +611,7 @@ async function run() {
     });
 
     // approve submission
-    app.patch("/submissions/:id/approve", async (req, res) => {
+    app.patch("/submissions/:id/approve", verifyJWT, async (req, res) => {
       const id = req.params.id;
 
       const submission = await submissionCollection.findOne({
@@ -507,7 +633,7 @@ async function run() {
     });
 
     // reject submission
-    app.patch("/submissions/:id/reject", async (req, res) => {
+    app.patch("/submissions/:id/reject", verifyJWT, async (req, res) => {
       const id = req.params.id;
 
       const submission = await submissionCollection.findOne({
@@ -528,7 +654,7 @@ async function run() {
     });
 
     // worker dashboard get all task
-    app.get("/tasks/available", async (req, res) => {
+    app.get("/tasks/available", verifyJWT, async (req, res) => {
       const tasks = await tasksCollection
         .find({ required_workers: { $gt: 0 } })
         .toArray();
@@ -556,7 +682,7 @@ async function run() {
       res.send(result);
     });
     //  create get submission routes
-    app.get("/submissions", async (req, res) => {
+    app.get("/submissions", verifyJWT, async (req, res) => {
       const email = req.query.email;
       if (!email) return res.send([]);
 
@@ -569,7 +695,7 @@ async function run() {
     // withdraw
     // Express POST route
     // Express POST route
-    app.post("/withdrawals", async (req, res) => {
+    app.post("/withdrawals", verifyJWT, async (req, res) => {
       const {
         worker_email,
         worker_name,
@@ -688,9 +814,9 @@ async function run() {
       }
     });
 
-    // Ping success
-    await client.db("admin").command({ ping: 1 });
-    console.log("MongoDB Connected ✅");
+    //// Ping success
+    //await client.db("admin").command({ ping: 1 });
+    //console.log("MongoDB Connected ✅");
   } finally {
     // Don't close client in development
     // await client.close();
