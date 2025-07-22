@@ -709,16 +709,37 @@ async function run() {
     });
 
     //  create get submission routes
+    // GET /submissions?email=worker@example.com&page=1&limit=10
     app.get("/submissions", verifyJWT, async (req, res) => {
-      const email = req.query.email;
-      if (!email) return res.send([]);
+      try {
+        const email = req.query.email;
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const skip = (page - 1) * limit;
 
-      const submissions = await submissionCollection
-        .find({ worker_email: email })
-        .toArray();
+        if (!email) return res.send([]);
 
-      res.send(submissions);
+        const query = { worker_email: email };
+
+        const submissions = await submissionCollection
+          .find(query)
+          .sort({ current_date: -1 }) // latest first
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+
+        const total = await submissionCollection.countDocuments(query);
+
+        res.send({
+          total,
+          submissions,
+        });
+      } catch (err) {
+        console.error("Error in paginated submissions:", err);
+        res.status(500).send({ message: "Internal server error" });
+      }
     });
+
     // withdraw
     // Express POST route
     // Express POST route
