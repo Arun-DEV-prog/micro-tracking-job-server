@@ -86,27 +86,27 @@ async function run() {
       });
     }
 
-    app.post("/notifications", async (req, res) => {
-      const { toEmail, message, actionRoute } = req.body;
+    //app.post("/notifications", async (req, res) => {
+    //  const { toEmail, message, actionRoute } = req.body;
 
-      if (!toEmail || !message) {
-        return res.status(400).send({ message: "Missing fields" });
-      }
+    //  if (!toEmail || !message) {
+    //    return res.status(400).send({ message: "Missing fields" });
+    //  }
 
-      const notification = {
-        toEmail,
-        message,
-        actionRoute: actionRoute || "/",
-        time: new Date(),
-      };
+    //  const notification = {
+    //    toEmail,
+    //    message,
+    //    actionRoute: actionRoute || "/",
+    //    time: new Date(),
+    //  };
 
-      try {
-        const result = await notificationCollection.insertOne(notification);
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ message: "Notification create failed" });
-      }
-    });
+    //  try {
+    //    const result = await notificationCollection.insertOne(notification);
+    //    res.send(result);
+    //  } catch (error) {
+    //    res.status(500).send({ message: "Notification create failed" });
+    //  }
+    //});
 
     app.get("/notifications/:email", async (req, res) => {
       const email = req.params.email;
@@ -120,56 +120,6 @@ async function run() {
     // =============================
     // ✅ Create New Submission (Worker to Buyer Notification)
     // =============================
-    app.post("/submissions", verifyJWT, async (req, res) => {
-      const submission = req.body;
-      const result = await submissionCollection.insertOne(submission);
-
-      // Notify Buyer
-      const task = await tasksCollection.findOne({
-        _id: new ObjectId(submission.task_id),
-      });
-      const buyer = await usersCollection.findOne({ email: task.buyer_email });
-
-      await createNotification({
-        message: `${submission.worker_name} submitted work for your task "${task.task_title}"`,
-        toEmail: buyer.email,
-        actionRoute: "/dashboard/buyer-review",
-      });
-
-      res.send(result);
-    });
-
-    app.patch("/submissions/status/:id", verifyJWT, async (req, res) => {
-      const id = req.params.id;
-      const { status, payable_amount } = req.body;
-
-      const submission = await submissionCollection.findOne({
-        _id: new ObjectId(id),
-      });
-      const task = await tasksCollection.findOne({
-        _id: new ObjectId(submission.task_id),
-      });
-
-      await submissionCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: { status } }
-      );
-
-      let msg = "";
-      if (status === "approved") {
-        msg = `You have earned $${payable_amount} from ${task.buyer_name} for completing "${task.task_title}"`;
-      } else if (status === "rejected") {
-        msg = `Your submission for "${task.task_title}" was rejected by ${task.buyer_name}`;
-      }
-
-      await createNotification({
-        message: msg,
-        toEmail: submission.worker_email,
-        actionRoute: "/dashboard/worker-home",
-      });
-
-      res.send({ message: "Status updated and notification sent" });
-    });
 
     app.patch("/withdrawals/approve/:id", verifyJWT, async (req, res) => {
       const id = req.params.id;
@@ -287,6 +237,13 @@ async function run() {
           { email: request.worker_email },
           { $inc: { coin: -request.withdrawal_coin } }
         );
+
+        await notificationCollection.insertOne({
+          toEmail: request.worker_email,
+          message: `Your withdrawal request of $${withdrawal.withdrawal_amount} was approved.`,
+          actionRoute: "/dashboard/worker-home",
+          time: new Date(),
+        });
 
         res.send({ message: "Withdrawal approved and coins deducted" });
       }
@@ -614,22 +571,40 @@ async function run() {
     app.patch("/submissions/:id/approve", verifyJWT, async (req, res) => {
       const id = req.params.id;
 
-      const submission = await submissionCollection.findOne({
-        _id: new ObjectId(id),
-      });
+      try {
+        const submission = await submissionCollection.findOne({
+          _id: new ObjectId(id),
+        });
 
-      const updateSubmission = await submissionCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: { status: "approved" } }
-      );
+        if (!submission) {
+          return res.status(404).send({ message: "Submission not found" });
+        }
 
-      // Update worker coin
-      await usersCollection.updateOne(
-        { email: submission.worker_email },
-        { $inc: { coin: submission.payable_amount } }
-      );
+        // 1. Approve submission
+        const updateSubmission = await submissionCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status: "approved" } }
+        );
 
-      res.send(updateSubmission);
+        // 2. Add coin to worker
+        const workerUpdate = await usersCollection.updateOne(
+          { email: submission.worker_email },
+          { $inc: { coin: submission.payable_amount } }
+        );
+
+        // 3. Send notification to worker
+        await notificationCollection.insertOne({
+          toEmail: submission.worker_email, // ✅ Add this
+          message: `You earned ${submission.payable_amount} for this task "${submission.task_title}"`,
+          actionRoute: "/dashboard/worker-home",
+          time: new Date(),
+        });
+
+        res.send({ modifiedCount: updateSubmission.modifiedCount });
+      } catch (error) {
+        console.error("Error approving submission:", error);
+        res.status(500).send({ message: "Internal server error" });
+      }
     });
 
     // reject submission
@@ -649,6 +624,13 @@ async function run() {
         { _id: new ObjectId(submission.task_id) },
         { $inc: { required_workers: 1 } }
       );
+
+      await notificationCollection.insertOne({
+        toEmail: submission.worker_email,
+        message: `Your submission for task "${submission.task_title}" was rejected.`,
+        actionRoute: "/dashboard/worker-home",
+        time: new Date(),
+      });
 
       res.send(updateSubmission);
     });
@@ -670,17 +652,62 @@ async function run() {
 
     // worl submissions
     app.post("/submissions", async (req, res) => {
-      const submission = req.body;
-      const result = await submissionCollection.insertOne(submission);
+      const {
+        task_id,
+        task_title,
+        worker_name,
+        worker_email,
+        buyer_email,
+        Buyer_email, // fallback
+        Buyer_name,
+        submission_details,
+        payable_amount,
+      } = req.body;
 
-      // Optional: Decrease required_workers by 1
-      await tasksCollection.updateOne(
-        { _id: new ObjectId(submission.task_id) },
-        { $inc: { required_workers: -1 } }
-      );
+      const finalBuyerEmail = buyer_email || Buyer_email;
 
-      res.send(result);
+      // Validate required fields
+      if (!task_id || !worker_email || !finalBuyerEmail) {
+        return res.status(400).send({ message: "Missing required fields" });
+      }
+
+      const submission = {
+        task_id,
+        task_title: task_title || "",
+        worker_name: worker_name || "",
+        worker_email,
+        buyer_email: finalBuyerEmail,
+        buyer_name: Buyer_name || "", // optional
+        submission_details: submission_details || "",
+        payable_amount: payable_amount || 0,
+        status: "pending",
+        submit_time: new Date(),
+      };
+
+      try {
+        const result = await submissionCollection.insertOne(submission);
+
+        // Decrease required_workers by 1
+        await tasksCollection.updateOne(
+          { _id: new ObjectId(task_id) },
+          { $inc: { required_workers: -1 } }
+        );
+
+        // Send notification to buyer
+        await notificationCollection.insertOne({
+          message: `${submission.worker_name} submitted a task "${submission.task_title}"`,
+          toEmail: finalBuyerEmail,
+          actionRoute: "/dashboard/buyer-home",
+          time: new Date(),
+        });
+
+        res.send(result);
+      } catch (error) {
+        console.error("Error creating submission:", error);
+        res.status(500).send({ message: "Internal server error" });
+      }
     });
+
     //  create get submission routes
     app.get("/submissions", verifyJWT, async (req, res) => {
       const email = req.query.email;
