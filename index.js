@@ -388,23 +388,6 @@ async function run() {
       }
     });
 
-    app.delete("/task/:id", async (req, res) => {
-      const id = req.params.id;
-      try {
-        const result = await tasksCollection.deleteOne({
-          _id: new ObjectId(id),
-        });
-        if (result.deletedCount === 1) {
-          res.status(200).json({ message: "Task deleted" });
-        } else {
-          res.status(404).json({ message: "Task not found" });
-        }
-      } catch (error) {
-        res
-          .status(500)
-          .json({ message: "Failed to delete task", error: error.message });
-      }
-    });
     // Get tasks by buyer email
     app.get("/tasks/buyer/:email", async (req, res) => {
       const email = req.params.email;
@@ -430,7 +413,7 @@ async function run() {
       // Refill coins only if task not completed (add your own completed logic if needed)
       await usersCollection.updateOne(
         { email: task.buyer_email },
-        { $inc: { coins: totalRefund } }
+        { $inc: { coin: totalRefund } }
       );
 
       res.send({ message: "Task deleted and coins refunded if uncompleted" });
