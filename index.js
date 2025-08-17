@@ -619,11 +619,29 @@ async function run() {
     });
 
     // worker dashboard get all task
-    app.get("/tasks/available", verifyJWT, async (req, res) => {
-      const tasks = await tasksCollection
-        .find({ required_workers: { $gt: 0 } })
-        .toArray();
-      res.send(tasks);
+    app.get("/tasks/available", async (req, res) => {
+      try {
+        const sortOrder = req.query.sort; // "asc" or "desc"
+        let sortOption = {};
+
+        if (sortOrder === "asc") {
+          sortOption = {
+            payable_amount: 1,
+          }; // ascending
+        } else if (sortOrder === "desc") {
+          sortOption = { payable_amount: -1 }; // descending
+        }
+
+        const tasks = await tasksCollection
+          .find({ required_workers: { $gt: 0 } })
+          .sort(sortOption) // apply sort if any
+          .toArray();
+
+        res.send(tasks);
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ error: "Failed to fetch tasks" });
+      }
     });
 
     // TaskList
@@ -774,9 +792,16 @@ async function run() {
       try {
         const bestWorkers = await usersCollection
           .find({ role: "Worker" })
+          .project({
+            name: 1,
+            email: 1,
+            coin: 1,
+            photoURL: 1, // ✅ include photoURL
+            _id: 0, // optional: hide _id if not needed
+          })
           .sort({ coin: -1 })
           .limit(6)
-          .project({ name: 1, email: 1, coin: 1, photo: 1 })
+
           .toArray();
 
         res.json(bestWorkers);
